@@ -21,6 +21,7 @@ import logging
 import os
 import time
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import httpx
 import psycopg2
@@ -69,9 +70,24 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 # ────────────────────────────────────────────────────────────────────────────
 # DB helpers (psycopg2 puro — sem ORM)
 # ────────────────────────────────────────────────────────────────────────────
+def _clean_db_url(url: str) -> str:
+    """Remove ?schema=... da DATABASE_URL — esse parâmetro é só do Prisma
+    (LiteLLM v1 usa Prisma). psycopg2 não entende e dá ProgrammingError.
+    O schema correto é forçado via search_path no options."""
+    if not url:
+        return url
+    parsed = urlparse(url)
+    query_pairs = [(k, v) for k, v in parse_qsl(parsed.query) if k.lower() != "schema"]
+    return urlunparse(parsed._replace(query=urlencode(query_pairs)))
+
+
 def _db():
-    """Conexão Postgres com schema=gateway. Schema setado em init_db()."""
-    return psycopg2.connect(DATABASE_URL, options="-c search_path=gateway_v2,public")
+    """Conexão Postgres com search_path=gateway_v2,public.
+    DATABASE_URL passa pelo strip de ?schema= (parâmetro Prisma)."""
+    return psycopg2.connect(
+        _clean_db_url(DATABASE_URL),
+        options="-c search_path=gateway_v2,public",
+    )
 
 
 def init_db():
