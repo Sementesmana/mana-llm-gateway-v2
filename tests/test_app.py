@@ -153,3 +153,64 @@ def test_readiness_responde():
     assert "db" in data
     assert "anthropic" in data
     assert "openai" in data
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Endpoints admin compat LiteLLM (consumidos pelo agente-monitor)
+# ──────────────────────────────────────────────────────────────────────
+def test_key_list_sem_master_retorna_401():
+    cli = app.test_client()
+    r = cli.get("/key/list")
+    assert r.status_code == 401
+
+
+def test_key_list_master_correto_retorna_200():
+    cli = app.test_client()
+    r = cli.get(
+        "/key/list",
+        headers={"Authorization": "Bearer test-master"},
+    )
+    # Sem DATABASE_URL real (modo teste) retorna lista vazia
+    assert r.status_code == 200
+    data = r.get_json()
+    assert "keys" in data
+    assert "total_pages" in data
+
+
+def test_model_info_sem_master_retorna_401():
+    cli = app.test_client()
+    r = cli.get("/model/info")
+    assert r.status_code == 401
+
+
+def test_model_info_master_correto_lista_aliases():
+    cli = app.test_client()
+    r = cli.get("/model/info", headers={"Authorization": "Bearer test-master"})
+    assert r.status_code == 200
+    data = r.get_json()
+    assert "data" in data
+    aliases = [m["model_name"] for m in data["data"]]
+    # Tem todos os aliases canônicos
+    assert "mana-rapido" in aliases
+    assert "mana-equilibrio" in aliases
+    assert "mana-juridico" in aliases
+    assert "mana-whisper" in aliases
+    assert "mana-voz" in aliases
+    # Modelo real correto pra haiku
+    haiku = next(m for m in data["data"] if m["model_name"] == "mana-rapido")
+    assert haiku["litellm_params"]["model"] == "claude-haiku-4-5"
+
+
+def test_spend_logs_sem_master_retorna_401():
+    cli = app.test_client()
+    r = cli.get("/spend/logs")
+    assert r.status_code == 401
+
+
+def test_spend_logs_master_correto_retorna_200():
+    cli = app.test_client()
+    r = cli.get("/spend/logs", headers={"Authorization": "Bearer test-master"})
+    # Sem DATABASE_URL retorna lista vazia, mas 200
+    assert r.status_code == 200
+    data = r.get_json()
+    assert isinstance(data, list)

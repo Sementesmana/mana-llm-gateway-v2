@@ -436,6 +436,127 @@ def gerar_chave():
     return jsonify({"id": chave_id, "alias": alias, "key": chave_plain, "agente": agente})
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# Admin — endpoints de cockpit compatíveis com LiteLLM v1
+# (consumidos pelo agente-monitor pra mostrar custo por agente)
+# ────────────────────────────────────────────────────────────────────────────
+@app.route("/key/list", methods=["GET"])
+def key_list():
+    """Compat LiteLLM /key/list. Lista chaves virtuais com spend acumulado
+    (uso_anthropic + uso_openai). Suporta paginação 10/página."""
+    if request.headers.get("Authorization", "") != f"Bearer {MASTER_KEY}":
+        return jsonify({"error": "unauthorized"}), 401
+    if not DATABASE_URL:
+        return jsonify({"keys": [], "total_pages": 0})
+
+    try:
+        page = int(request.args.get("page", 1))
+    except ValueError:
+        page = 1
+    per_page = 10
+    offset = (page - 1) * per_page
+
+    with _db() as con, con.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT COUNT(*) AS n FROM gateway_v2.chaves_virtuais WHERE ativo = TRUE")
+        total = cur.fetchone()["n"]
+        total_pages = max(1, (total + per_page - 1) // per_page)
+
+        cur.execute("""
+            SELECT id, alias, agente, limite_diario_usd, criado_em
+            FROM gateway_v2.chaves_virtuais
+            WHERE ativo = TRUE
+            ORDER BY id
+            LIMIT %s OFFSET %s
+        """, (per_page, offset))
+        chaves = cur.fetchall()
+
+        # Spend agregado por chave (anthropic + openai), modelos usados, last_active
+        chave_ids = [c["id"] for c in chaves]
+        spend_map = {}
+        if chave_ids:
+            cur.execute("""
+                SELECT chave_id,
+                       SUM(custo_usd) AS spend,
+                       MAX(created_at) AS last_active,
+                       array_agg(DISTINCT modelo) AS modelos
+                FROM (
+                    SELECT chave_id, custo_usd, created_at, modelo
+                    FROM gateway_v2.uso_anthropic
+                    WHERE chave_id = ANY(%s)
+                    UNION ALL
+                    SELECT chave_id, custo_usd, created_at, modelo
+                    FROM gateway_v2.uso_openai
+                    WHERE chave_id = ANY(%s)
+                ) t
+                GROUP BY chave_id
+            """, (chave_ids, chave_ids))
+            spend_map = {row["chave_id"]: row for row in cur.fetchall()}
+
+    keys = []
+    for c in chaves:
+        sp = spend_map.get(c["id"], {})
+        last_active = sp.get("last_active")
+        keys.append({
+            "key_alias": c["alias"],
+            "token": str(c["id"]),  # int do id como "token" — match com api_key em /spend/logs
+            "spend": float(sp.get("spend") or 0),
+            "max_budget": float(c["limite_diario_usd"]) if c["limite_diario_usd"] else None,
+            "models": sp.get("modelos") or [],
+            "last_active": last_active.isoformat() if last_active else None,
+        })
+
+    return jsonify({"keys": keys, "total_pages": total_pages})
+
+
+@app.route("/model/info", methods=["GET"])
+def model_info():
+    """Compat LiteLLM /model/info. Lista aliases canônicos Maná → modelo real."""
+    if request.headers.get("Authorization", "") != f"Bearer {MASTER_KEY}":
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = []
+    for alias, real in ALIASES_ANTHROPIC.items():
+        data.append({"model_name": alias, "litellm_params": {"model": real}})
+    for alias, real in ALIASES_OPENAI.items():
+        data.append({"model_name": alias, "litellm_params": {"model": real}})
+    return jsonify({"data": data})
+
+
+@app.route("/spend/logs", methods=["GET"])
+def spend_logs():
+    """Compat LiteLLM /spend/logs. Lista logs individuais de spend
+    (até 1000 mais recentes, ambos provedores)."""
+    if request.headers.get("Authorization", "") != f"Bearer {MASTER_KEY}":
+        return jsonify({"error": "unauthorized"}), 401
+    if not DATABASE_URL:
+        return jsonify([])
+
+    with _db() as con, con.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT chave_id, custo_usd, created_at, modelo,
+                   'anthropic' AS provider, tokens_in, tokens_out
+            FROM gateway_v2.uso_anthropic
+            UNION ALL
+            SELECT chave_id, custo_usd, created_at, modelo,
+                   'openai' AS provider, NULL, NULL
+            FROM gateway_v2.uso_openai
+            ORDER BY created_at DESC
+            LIMIT 1000
+        """)
+        logs = cur.fetchall()
+
+    return jsonify([
+        {
+            "api_key": str(lg["chave_id"]),  # match com "token" em /key/list
+            "spend": float(lg["custo_usd"] or 0),
+            "startTime": lg["created_at"].isoformat() if lg["created_at"] else None,
+            "model": lg["modelo"],
+            "provider": lg["provider"],
+        }
+        for lg in logs
+    ])
+
+
 @app.route("/health/liveliness", methods=["GET"])
 def liveliness():
     return "I'm alive!", 200
